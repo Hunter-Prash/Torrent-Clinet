@@ -1,0 +1,281 @@
+    PHASE 1
+bencodepy.decode(...)
+
+This takes that raw bencoded data and decodes it into a nested Python dictionary, based on the BitTorrent .torrent file format.
+
+.torrent files use a special encoding called bencoding, which is different from JSON or XML. It looks like this:
+
+d
+8:announce33:http://tracker.example.com
+4:info...
+e
+The decode() function reads this and turns it into:
+
+{
+  b'announce': b'http://tracker.example.com',
+  b'info': {
+    b'name': b'myfile.txt',
+    b'piece length': 16384,
+    b'pieces': b'\x1f\xab...\x42',  # raw binary hashes
+    b'length': 123456
+  }
+}
+So, what does raw_data hold?
+  After this line,raw_ data is a nested dictionary where all keys and values are in bytes, not strings or integers (yet).
+
+After Running Through decode_dict()
+
+{
+  'name': 'video.mp4',
+  'length': 102400,
+  'piece length': 16384,
+  'pieces': <raw binary string>
+}
+'name': the file name (for single-file torrents)
+'length': file size in bytes
+'piece length': chunk size each peer shares
+'pieces': raw SHA1 hashes — one hash per piece (20 bytes each)
+
+
+
+'''
+info_raw should always be a dict because .torrent files use info to describe the file or files.
+
+But if:
+The .torrent file is corrupte
+The bencodepy.decode() failed weirdly
+Or the top-level dict was already messed up
+A list
+A string
+Something totally broken
+💣 If it's not a dict, the current code just ignores it.
+Which means: no file name, no length, no piece count = nothing useful to show.
+'''
+-------------------------------------------------------------------------
+PHASE 2
+
+SCOPE:-
+    Yes — as you download each piece from peers, your client immediately runs the SHA1 hash check against the expected hash from the .torrent file.
+
+    If it matches ✅ — you save the piece and mark it as complete.
+    If it fails ❌ — you discard it and ask for that piece again.
+
+    This continuous download + verify + save cycle is exactly how real BitTorrent clients ensure data integrity while downloading.
+
+
+    The actual movie/game/data file you download (via a .torrent file) is just for testing purposes in Phase 2 right now — because:
+
+    Phase 2 needs real data to verify.
+
+    You're not building the whole downloader yet — you're just simulating:
+
+    “If I had a full file (or partial), could I verify its pieces correctly using the .torrent hash?”
+
+    So in Phase 2, the actual content file is:
+
+    A test target
+
+    Something to read from disk, break into pieces, and compare to the hashes from the .torrent file
+
+    ✅ Once you’ve proven you can verify downloaded data → you’ll build the downloader in Phase 3/4, where pieces are fetched dynamically.
+
+  CODE LOGICS OOF PHASE-2
+
+    Yes, it is compulsory for SHA-1 hashes to be 20 bytes (160 bits) long.
+
+SHA-1 always produces a hash output of 160 bits, which is exactly 20 bytes.
+
+The .torrent file doesn’t store your actual movie or game.
+Instead, it stores SHA1 hashes of pieces of that file.
+Each pieces is usually 16 KB = 16,384 bytes (can vary) or whatever piecelength
+The SHA1 hash of each piecelength piece is 20 bytes long.
+
+so we convert the piecelength of data we read from the disc to SHA1 and compare
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+                                                      PHASE 3
+
+
+
+Scope: This part focuses on the very first steps of interacting with a peer: creating a network connection and performing the BitTorrent handshake to confirm mutual interest in the same torrent.
+
+Part 1: Establishing Peer Connections and Handshaking
+Scope: This part focuses on the very first steps of interacting with a peer: creating a network connection and performing the BitTorrent handshake to confirm mutual interest in the same torrent.
+
+Details of Work:
+
+TCP Socket Creation: For every peer (identified by its IP address and port) received from the tracker, your client needs to initiate a standard TCP socket connection.
+
+Connection Pooling/Management: To handle multiple peers simultaneously, you'll need to employ a non-blocking I/O model. Python's asyncio or the lower-level selectors module are excellent choices for managing concurrent connections without freezing your program. This allows your client to listen for incoming data from many peers at once.
+
+Connection Error Handling: Not all connection attempts will succeed. You must gracefully handle common issues like connection refused (the peer isn't listening or rejects your connection), timeouts (the peer doesn't respond in time), or network unreachable errors. Implement a strategy to either retry these connections (perhaps with increasing delays) or simply discard unresponsive peers.
+
+BitTorrent Handshake Message Implementation: Before any data is exchanged, both client and peer perform a 68-byte handshake. You'll build this message, which includes:
+The protocol string ("BitTorrent protocol").
+Eight reserved bytes (for extensions).
+The info_hash of the torrent (critical for matching).
+Your client's unique peer_id.
+
+Send/Receive Handshake: Your client sends its handshake to the connected peer and then waits to receive the peer's handshake in return.
+
+Handshake Validation: Upon receiving a handshake, immediately verify that the peer's info_hash matches the info_hash of the torrent you're downloading. If they don't match, this peer is not participating in your torrent's swarm, and you should disconnect from them. 
+
+============================================
+
+Part 2: Initial Peer State Exchange
+Scope: After a successful handshake, peers exchange initial messages to declare what pieces of the file they have and their current "choke" and "interest" states, which dictate whether they can send or receive data.
+
+Details of Work:
+
+bitfield Message Exchange:
+Sending bitfield: Immediately after the handshake, construct and send a bitfield message. This message is a bitmap indicating which pieces of the torrent your client currently possesses. Initially, for a fresh download, this bitfield will be empty (all zeroes). If you're resuming a download, it will reflect the pieces you've already verified.
+
+BitTorrent Message Structure:
+All messages after the handshake follow a consistent format:
+
+Length Prefix (4 bytes, big-endian integer): Specifies the length of the message ID + payload.
+Message ID (1 byte): A single byte identifying the message type.
+Payload (variable length): The actual data for the message.
+Keep-Alive Message: A special case where the length prefix is 0 (b'\x00\x00\x00\x00') and there is no message ID or payload.
+
+
+Receiving bitfield: Parse the bitfield message received from the peer. This is crucial as it tells you what pieces the peer has available that you might want to download.
+
+choke and unchoke States:
+Understanding States: The BitTorrent protocol uses a "choking" mechanism. Initially, both your client and the peer are considered "choked" by each other. When choked by a peer, you cannot request data from them. When you choke a peer, they cannot request data from you. This mechanism is vital for congestion control and preventing leeching.
+
+Handling choke and unchoke Messages: Implement logic to process incoming choke and unchoke messages from peers. Your client's state (and its ability to request/send data) will change based on these messages.
+
+interested and not interested Messages:
+Sending interested: Based on the peer's bitfield and your client's current missing pieces, if the peer possesses any pieces that you need, you must send an interested message to them. This signals your desire to download from them.
+Receiving interested: If a peer sends your client an interested message, it means they want to download pieces from you. You'll handle responding to their requests and uploading data in Phase 2.
+
+====================================================
+
+
+ Part 3: Core Downloading - Requesting, Receiving & Verifying Pieces
+
+
+Now for the "next level shit," as you put it – the actual downloading of data! This is the heart of your BitTorrent client. This part involves continuously talking to the peers you've connected to, asking for data, receiving it, and making sure it's correct.
+
+Scope:
+This phase focuses on the continuous loop of requesting specific blocks of data from active peers, receiving those blocks, assembling them into complete torrent pieces, calculating their cryptographic hash, and finally, writing the verified pieces to your local disk. By the end of this, your client will be able to download the actual file!
+
+Details of Work:
+Since we're sticking to a flat, function-based approach without classes, we'll need a few shared data structures to manage the download state globally.
+
+Global Download State Variables:
+
+      my_bitfield (bytearray): This is your client's representation of which pieces you currently possess. Initially, it will be all zeros (meaning you have no pieces). As you successfully download and verify pieces, you'll flip the corresponding bit to 1.
+
+      torrent_piece_hashes (bytes): This will be the concatenated SHA1 hashes of all pieces, extracted directly from the torrent file's metadata. You'll use this to verify downloaded pieces.
+
+      download_progress (list of bytes or None): This will be a list, where each element corresponds to a piece. It will temporarily hold the received blocks for a piece until it's complete and verified. None indicates the piece isn't being actively downloaded yet. For a given piece, this will actually be a bytearray where incoming blocks are written.
+      
+      outstanding_requests (dictionary): A simple way to keep track of which blocks you've requested from which peer to avoid requesting the same block multiple times or getting stuck waiting. {(piece_idx, block_offset): peer_writer}.
+
+      file_handle (file object): The open file where the downloaded data will be written.
+
+2. send_message(writer, message_id, payload=b'') (Revisited):
+We'll continue to use this helper for sending all BitTorrent messages.
+
+3.  read_message(reader) (Revisited):
+We'll continue to use this helper for reading all BitTorrent messages.
+
+4.peer_download_loop(peer_state, torrent_info) (New Async Function):
+This will be the main loop for each active peer. It runs continuously as long as the connection is open.
+
+    Message Reading: Inside an infinite loop, it await read_message(peer_state['reader']).
+
+    Message Processing (Switch-Case Logic):
+        MSG_CHOKE (ID 0): Peer is choking you. You cannot request new blocks from them. Set peer_state['peer_choking'] = True.
+
+        MSG_UNCHOKE (ID 1): Peer is unchoking you. You can now request blocks. Set peer_state['peer_choking'] = False. This is a crucial message!
+
+        MSG_INTERESTED (ID 2): Peer wants to download from you. Set peer_state['peer_interested'] = True. (Uploading will be handled in Phase 2).
+
+        MSG_NOT_INTERESTED (ID 3): Peer no longer wants to download from you. Set peer_state['peer_interested'] = False.
+
+        MSG_HAVE (ID 4): Peer announces they have a new piece. The payload contains the piece_index (4 bytes). Update their peer_bitfield if they are now advertising a piece you need.
+
+        MSG_BITFIELD (ID 5): (Handled in Part 2, but could be sent again by peers if they were slow).
+
+        MSG_REQUEST (ID 6): Peer is requesting a block from you. (Uploading, Phase 2).
+
+        MSG_PIECE (ID 7): This is the most important message for downloading.
+                Payload: piece_index (4 bytes), block_offset (4 bytes), block_data (variable length, usually 16KB).
+
+                Store block_data in the correct download_progress buffer for that piece_index at the block_offset.
+
+                Mark the specific block as received.
+
+                If all blocks for that piece are now received, trigger Piece Assembly & Verification.
+        
+        MSG_CANCEL (ID 8): Peer canceled a request.
+        MSG_PORT (ID 9): DHT port information.
+        None, None (Keep-Alive): Just received a keep-alive; reset inactivity timer.
+
+
+5. request_missing_blocks(peer_state, torrent_info) (Helper Function, called from loop):
+This function will be called within peer_download_loop when appropriate (e.g., after UNCHOKE or PIECE messages).
+
+Condition: Only request if peer_state['peer_choking'] is False and you are am_interested in them.
+Find Piece to Request: Iterate through your my_bitfield to find a piece you don't have. Check if the peer_bitfield indicates the peer does have that piece.
+Find Block to Request: Within that chosen piece, determine which 16KB blocks are still missing (and not already requested from another peer).
+Construct and Send request: Use send_message to send MSG_REQUEST with piece_index, block_offset, and block_length.
+Add the requested block to outstanding_requests.
+
+6.verify_and_save_piece(piece_index, piece_data, torrent_info) (Helper Function):
+This function is called once all blocks for a piece are received and assembled.
+
+Calculate hashlib.sha1(piece_data).digest().
+Compare this with torrent_piece_hashes[piece_index * 20 : (piece_index + 1) * 20].
+If matches:
+Write piece_data to file_handle at the correct offset (piece_index * torrent_info['piece length']).
+Update my_bitfield[piece_index] to 1.
+Trigger sending MSG_HAVE to all other active peers.
+(If this is the last piece, you've completed the download!)
+If not matches:
+Discard piece_data from buffer.
+Mark all blocks for this piece as unreceived again so they can be re-requested.
+
+
+Explanation of New Concepts:
+
+global_torrent_state: This is a dictionary used to hold all the global information about the torrent being downloaded and the overall download progress. Since we're avoiding classes, this acts as a centralized place for data shared across various functions.
+
+peer_download_loop(peer_state):
+This is an async function that will run as a continuous loop for each successfully connected peer.
+It constantly tries to read_message from the peer and processes all incoming messages (choke, unchoke, have, piece, etc.).
+Crucially, when the peer is unchoked and your client is interested, it calls get_next_block_request to find a block to download.
+When it receives a MSG_PIECE, it processes the incoming data, stores it, and triggers verify_and_save_piece if a piece is complete.
+
+get_next_block_request(peer_state):
+This function implements a very basic piece selection strategy: it looks for the first piece you don't have, that the peer does have, and then finds the first missing 16KB block within that piece.
+It manages your download_progress buffer for individual pieces and adds requested blocks to outstanding_requests.
+
+verify_and_save_piece(piece_index, piece_data):
+This function takes a fully assembled piece (all its blocks received).
+It calculates the SHA1 hash of the piece_data.
+It compares this hash to the expected hash from global_torrent_state['piece_hashes'].
+If the hashes match, it writes the piece to the disk, updates my_bitfield, increments downloaded_bytes, and sends MSG_HAVE to other peers.
+If hashes don't match, it discards the data and flags the piece for re-download.
+
+Concurrent Download Loops: main_peer_connection_phase now starts peer_download_loop as separate asyncio.Task instance
+for each active peer. This allows your client to download from multiple peers simultaneously.
+
+
+
+
+
+
+
+
+
+
+
+
+
