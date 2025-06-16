@@ -59,25 +59,47 @@ global_torrent_state = {
 
 async def send_message(writer: asyncio.StreamWriter, message_id: int, payload: bytes = b''):
     """
-    Constructs and sends a BitTorrent message (length prefix + ID + payload).
+    Constructs and sends a BitTorrent protocol message to a peer using the provided asyncio StreamWriter.
+
+    BitTorrent message format (after handshake):
+        - 4 bytes: length prefix (big-endian unsigned int, includes message ID + payload, excludes the prefix itself)
+        - 1 byte: message ID (integer 0-9, see protocol spec)
+        - N bytes: payload (optional, depends on message type)
 
     Args:
         writer (asyncio.StreamWriter): The writer stream for the peer connection.
-        message_id (int): The single-byte message ID.
-        payload (bytes): The message payload (can be empty bytes for some messages).
+        message_id (int): The single-byte message ID (e.g., MSG_REQUEST, MSG_PIECE, etc.).
+        payload (bytes): The message payload (can be empty bytes for messages with no payload).
+
+    Notes:
+        
+        - If the writer is already closing, the function returns immediately and does not attempt to send.
+        
     """
     if writer.is_closing():
+        # If the writer is already closing, do not attempt to send.
+        # This prevents exceptions from being raised on a closed stream.
         # print(f"Attempted to send message to closing writer.") # Too chatty
         return
 
+    # Calculate the total message length (1 byte for message ID + payload length)
     message_length = 1 + len(payload)
+
+    # Convert the message length to a 4-byte big-endian integer (length prefix)
     length_prefix_bytes = message_length.to_bytes(4, byteorder='big')
+
+    # Convert the message ID to a single byte
     message_id_byte = bytes([message_id])
 
     try:
+        # Write the message to the stream: [length prefix][message ID][payload]
         writer.write(length_prefix_bytes + message_id_byte + payload)
+
+        # Await drain to ensure the message is actually sent to the peer
         await writer.drain()
     except Exception as e:
+        # If any error occurs (e.g., connection reset, broken pipe), log it.
+        # The caller should handle further cleanup/disconnection as needed.
         print(f"Error sending message (ID: {message_id}) to peer: {e}")
         # Mark writer as problematic, should lead to disconnection
 
@@ -99,39 +121,58 @@ async def send_message(writer: asyncio.StreamWriter, message_id: int, payload: b
 
 async def read_message(reader: asyncio.StreamReader) -> tuple[int | None, bytes | None]:
     """
-    Reads a BitTorrent message from the stream.
-    Returns (message_id, payload_bytes) or (None, None) for keep-alive,
-    or (False, False) on disconnect/error.
+    Reads a BitTorrent protocol message from the given asyncio StreamReader.
+
+    Returns:
+        (message_id, payload_bytes): 
+            - message_id (int): The message type ID (0-9), or None for keep-alive, or False for disconnect/error.
+            - payload_bytes (bytes): The message payload (may be empty), or None for keep-alive, or False for disconnect/error.
+
+    Special cases:
+        - (None, None): Indicates a keep-alive message (length prefix is 0, no message ID or payload).
+        - (False, False): Indicates the peer disconnected or an error occurred (should close connection).
+
+    BitTorrent message format:
+        - 4 bytes: length prefix (big-endian unsigned int, includes message ID + payload, excludes the prefix itself)
+        - 1 byte: message ID (not present for keep-alive)
+        - N bytes: payload (optional, depends on message type)
     """
     try:
-        # Read the 4-byte length prefix
+        # --- Step 1: Read the 4-byte length prefix ---
+        # This tells us how many bytes to expect for the rest of the message (ID + payload).
         length_prefix_bytes = await reader.readexactly(4)
         message_length = int.from_bytes(length_prefix_bytes, byteorder='big')
 
         if message_length == 0:
-            # Keep-alive message
+            # --- Special Case: Keep-alive message ---
+            # No message ID or payload follows. Used to keep the connection open.
             return None, None
 
-        # Read the message ID (1 byte)
+        # --- Step 2: Read the 1-byte message ID ---
+        # All non-keep-alive messages have a single-byte ID after the length prefix.
         message_id_byte = await reader.readexactly(1)
         message_id = message_id_byte[0]
 
-        # Read the payload
+        # --- Step 3: Read the payload (if any) ---
+        # The payload length is (message_length - 1), since 1 byte is for the message ID.
         payload = b''
         if message_length > 1:
             payload = await reader.readexactly(message_length - 1)
 
+        # --- Step 4: Return the parsed message ID and payload ---
         return message_id, payload
 
     except asyncio.IncompleteReadError:
-        # print("Peer disconnected during message read (IncompleteReadError).") # Too chatty
-        return False, False # Signal disconnection
+        # This exception occurs if the peer closes the connection or sends less data than expected.
+        # We treat this as a disconnection and signal the caller to close the connection.
+        # (False, False) is a sentinel value for disconnect/error.
+        return False, False
     except asyncio.TimeoutError:
-        # print("Timeout during message read from peer.") # Too chatty
-        return False, False # Signal disconnection
+        # If a timeout occurs while reading, treat as a disconnect (peer is unresponsive).
+        return False, False
     except Exception as e:
-        # print(f"Error reading message from peer: {e}") # Too chatty for frequent errors
-        return False, False # Signal disconnection
+        # Any other exception (e.g., connection reset, protocol error) is also treated as a disconnect.
+        return False, False
 
 
 
@@ -295,84 +336,108 @@ async def handle_peer_initial_messages(
     """
     Handles the initial message exchange with a peer after a successful handshake.
     Returns a peer_state dictionary on success, None on failure.
+
+    Steps:
+        1. Wait for the peer's initial message (usually BITFIELD, but could be CHOKE, UNCHOKE, etc.).
+        2. Parse and store the peer's bitfield if received.
+        3. Send our own bitfield (all zeros at the start, since we have no pieces yet).
+        4. Decide whether to send INTERESTED (if the peer has any pieces we don't).
+        5. Return a peer_state dictionary with all relevant info for further communication.
     """
     peer_addr = f"{ip}:{port}"
+    # Initialize the peer_state dictionary with connection and protocol state.
     peer_state = {
         'ip': ip,
         'port': port,
         'reader': reader,
         'writer': writer,
         'peer_id': peer_peer_id,
-        'peer_choking': True,        # Initially, peer chokes us
-        'peer_interested': False,    # Initially, peer is not interested in us
-        'am_choking': True,          # Initially, we choke the peer
-        'am_interested': False,      # FIX: Corrected typo from 'am_intrested' to 'am_interested'
-        'peer_bitfield': None,       # To store the bitfield received from the peer
-        'last_activity': asyncio.get_event_loop().time() # For keeping track of active connections
+        'peer_choking': True,        # By protocol, peers start by choking us.
+        'peer_interested': False,    # By protocol, peers start not interested in us.
+        'am_choking': True,          # We start by choking the peer (not uploading).
+        'am_interested': False,      # We start not interested (until we see their bitfield).
+        'peer_bitfield': None,       # Will be set if peer sends a BITFIELD message.
+        'last_activity': asyncio.get_event_loop().time() # Timestamp for activity tracking.
     }
 
     try:
         print(f"[{peer_addr}] Waiting for initial message (bitfield/choke/unchoke)...")
-        # Use a short timeout for initial read; could be keep-alive or slow peer
+        # Wait for the first message from the peer, with a timeout to avoid hanging forever.
+        # This could be a BITFIELD (most common), or a control message (CHOKE, UNCHOKE, etc.).
         message_id, payload = await asyncio.wait_for(read_message(reader), timeout=10)
 
+        # --- 1. Handle the peer's initial message ---
         if message_id == MSG_BITFIELD:
+            # Peer sent us their bitfield, indicating which pieces they have which is stored in the variable 'payload'
             expected_bitfield_len = (torrent_num_pieces + 7) // 8
             if len(payload) == expected_bitfield_len:
-                peer_state['peer_bitfield'] = bytearray(payload) # FIX: Convert payload to bytearray for mutability
+                # Store the peer's bitfield as a mutable bytearray for later updates.
+                peer_state['peer_bitfield'] = bytearray(payload)
                 print(f"[{peer_addr}] Received bitfield. Length: {len(payload)} bytes.")
-                # We can now potentially become 'interested'
+                # Now we know what pieces the peer has, so we can decide if we're interested.
             else:
+                # Bitfield length is wrong (could indicate a buggy or malicious peer).
                 print(f"[{peer_addr}] Received malformed bitfield (unexpected length: {len(payload)}). Disconnecting.")
                 return None
             
         elif message_id == MSG_CHOKE:
+            # Peer is choking us (won't upload to us yet).
             peer_state['peer_choking'] = True
             print(f"[{peer_addr}] Received CHOKE message.")
         elif message_id == MSG_UNCHOKE:
+            # Peer is unchoking us (may upload to us).
             peer_state['peer_choking'] = False
             print(f"[{peer_addr}] Received UNCHOKE message.")
         elif message_id == MSG_INTERESTED:
+            # Peer is interested in our pieces (not relevant for download-only client).
             peer_state['peer_interested'] = True
             print(f"[{peer_addr}] Received INTERESTED message.")
         elif message_id == MSG_NOT_INTERESTED:
+            # Peer is not interested in our pieces.
             peer_state['peer_interested'] = False
             print(f"[{peer_addr}] Received NOT_INTERESTED message.")
-        elif message_id is None and payload is None: # Keep-alive
+        elif message_id is None and payload is None:
+            # Peer sent a keep-alive message (no payload, just to keep connection open).
             print(f"[{peer_addr}] Received KEEP-ALIVE message.")
-        elif message_id is False and payload is False: # Disconnection signal from read_message
+        elif message_id is False and payload is False:
+            # read_message signals a disconnect or error.
             print(f"[{peer_addr}] Peer disconnected during initial message exchange.")
             return None
         else:
+            # Peer sent an unexpected message type as the first message.
             print(f"[{peer_addr}] Received unexpected initial message (ID: {message_id}).")
 
-        # --- 2. Send Our Bitfield ---
-        # Our client starts with no pieces, so send an all-zero bitfield.
-        # global_torrent_state['my_bitfield'] is already initialized as bytearray() in global_torrent_state
-        # and its size is set in main_peer_connection_phase
-        
+        # --- 2. Send our own bitfield to the peer ---
+        # By protocol, after handshake and initial message, we send our bitfield.
+        # At this point, we have no pieces, so our bitfield is all zeros.
+        # global_torrent_state['my_bitfield'] is already initialized in main_peer_connection_phase.
         await send_message(writer, MSG_BITFIELD, global_torrent_state['my_bitfield'])
         print(f"[{peer_addr}] Sent our bitfield. Length: {len(global_torrent_state['my_bitfield'])} bytes.")
 
-        # --- 3. Determine and Send Interested Message ---
-        # For now, we become interested if the peer has any piece we don't have.
-        # A simple check: if their bitfield is not empty (they have *something*) AND
-        # it's not the same as our all-zero bitfield.
+        # --- 3. Decide whether to send INTERESTED ---
+        # We should send INTERESTED if the peer has any pieces we don't have.
+        # This is a simple check: if their bitfield is not empty and not identical to ours (all zeros).
         if peer_state['peer_bitfield'] and peer_state['peer_bitfield'] != global_torrent_state['my_bitfield']:
+            # Peer has at least one piece we don't have, so we are interested.
             await send_message(writer, MSG_INTERESTED)
-            peer_state['am_interested'] = True # FIX: Corrected typo from 'am_intrested' to 'am_interested'
+            peer_state['am_interested'] = True
             print(f"[{peer_addr}] Sent INTERESTED message.")
         else:
+            # Peer has no pieces we need, or we didn't get a bitfield yet.
             print(f"[{peer_addr}] Not sending INTERESTED message (no interesting pieces or peer's bitfield not received yet).")
 
-        peer_state['last_activity'] = asyncio.get_event_loop().time() # Update activity time
+        # Update last activity timestamp for this peer.
+        peer_state['last_activity'] = asyncio.get_event_loop().time()
+        # Return the peer_state dictionary for use in download loop.
         return peer_state
 
     except asyncio.TimeoutError:
+        # Peer didn't send any message in time; treat as a failed connection.
         print(f"[{peer_addr}] Timeout waiting for initial message exchange.")
         if writer: writer.close()
         return None
     except Exception as e:
+        # Any other error (network, protocol, etc.).
         print(f"Error during initial message exchange with {peer_addr}: {e}")
         if writer: writer.close()
         return None
