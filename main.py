@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import base64
 
 # Import functions from your parser.py
 from parser import parse_torrent_file, getinfo_hash
@@ -21,10 +22,15 @@ if __name__ == "__main__":
     # 'announce_url' will be the tracker URL.
     info, announce_url = parse_torrent_file(torrent_path) 
     
+    
     # 2. Get the info_hash (20-byte bytes object)
     # This is crucial for the BitTorrent handshake.
     info_hash = getinfo_hash(torrent_path) 
+    #print(info_hash.hex())
+    #print(base64.b64encode(info_hash).decode())
+   # time.sleep(30)
 
+   
     # 3. Generate your client's unique peer ID (20-byte bytes object)
     peerId = getpeerID() 
 

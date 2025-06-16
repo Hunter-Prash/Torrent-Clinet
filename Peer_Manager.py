@@ -48,6 +48,15 @@ global_torrent_state = {
 }
 
 
+
+
+
+
+
+
+
+
+
 async def send_message(writer: asyncio.StreamWriter, message_id: int, payload: bytes = b''):
     """
     Constructs and sends a BitTorrent message (length prefix + ID + payload).
@@ -71,6 +80,21 @@ async def send_message(writer: asyncio.StreamWriter, message_id: int, payload: b
     except Exception as e:
         print(f"Error sending message (ID: {message_id}) to peer: {e}")
         # Mark writer as problematic, should lead to disconnection
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 async def read_message(reader: asyncio.StreamReader) -> tuple[int | None, bytes | None]:
@@ -110,10 +134,34 @@ async def read_message(reader: asyncio.StreamReader) -> tuple[int | None, bytes 
         return False, False # Signal disconnection
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def perform_handshake(ip: str, port: int, info_hash: bytes, my_peer_id: bytes):
     """
-    Establishes a TCP connection, performs the handshake, and validates it.
-    Returns (reader, writer, peer_peer_id) if handshake is successful, else (None, None, None).
+    Establishes a TCP connection to a peer, performs the BitTorrent handshake, and validates the response.
+
+    Args:
+        ip (str): The IP address of the peer to connect to.
+        port (int): The port number of the peer.
+        info_hash (bytes): The 20-byte SHA1 hash of the torrent's info dictionary.
+        my_peer_id (bytes): The 20-byte peer ID of our client.
+
+    Returns:
+        tuple: (reader, writer, peer_peer_id) if handshake is successful,
+               (None, None, None) otherwise.
     """
     peer_addr = f"{ip}:{port}"
     print(f"Attempting to connect to peer: {peer_addr}")
@@ -122,70 +170,118 @@ async def perform_handshake(ip: str, port: int, info_hash: bytes, my_peer_id: by
     writer = None
 
     try:
+        # --- 1. Establish TCP Connection ---
+        # Use asyncio's open_connection to create a StreamReader and StreamWriter for the peer.
+        # Set a timeout to avoid hanging on unresponsive peers.
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port),
             timeout=5
         )
         print(f"Successfully connected to peer: {peer_addr}")
 
+        # --- 2. Validate Handshake Inputs ---
+        # The info_hash and peer_id must be exactly 20 bytes as per the BitTorrent protocol.
         if not isinstance(info_hash, bytes) or len(info_hash) != 20:
             raise ValueError("info_hash must be a 20-byte bytes object.")
         if not isinstance(my_peer_id, bytes) or len(my_peer_id) != 20:
             raise ValueError("my_peer_id must be a 20-byte bytes object.")
 
+        # --- 3. Construct Handshake Message ---
+        # Handshake format:
+        # <pstrlen><pstr><reserved><info_hash><peer_id>
+        # - pstrlen: 1 byte, length of protocol string (should be 19 for "BitTorrent protocol")
+        # - pstr: protocol string ("BitTorrent protocol")
+        # - reserved: 8 bytes, all zero (for extension negotiation)
+        # - info_hash: 20 bytes, SHA1 hash of the info dict from the .torrent file
+        # - peer_id: 20 bytes, unique ID for this client
         handshake_message = (
-            bytes([PROTOCOL_STRING_LEN]) +
-            PROTOCOL_STRING +
-            b'\x00' * 8 +
-            info_hash +
-            my_peer_id
+            bytes([PROTOCOL_STRING_LEN]) +  # pstrlen
+            PROTOCOL_STRING +               # pstr
+            b'\x00' * 8 +                   # reserved
+            info_hash +                     # info_hash
+            my_peer_id                      # peer_id
         )
 
+        # --- 4. Send Handshake ---
         writer.write(handshake_message)
         await writer.drain()
 
+        # --- 5. Receive and Parse Peer Handshake ---
+        # The handshake response should be exactly HANDSHAKE_LENGTH bytes.
         received_handshake = await asyncio.wait_for(
             reader.readexactly(HANDSHAKE_LENGTH),
             timeout=5
         )
 
+        # --- 6. Validate Handshake Response ---
+        # Parse the handshake fields:
+        # - First byte: protocol string length
         pstrlen_received = received_handshake[0]
         if pstrlen_received != PROTOCOL_STRING_LEN:
             print(f"Handshake failed with {peer_addr}: Unexpected protocol string length ({pstrlen_received} instead of {PROTOCOL_STRING_LEN}).")
             return None, None, None
 
+        # - Next pstrlen bytes: protocol string
         pstr_received = received_handshake[1 : 1 + pstrlen_received]
+
+        # - Next 8 bytes: reserved (skip)
+        # - Next 20 bytes: info_hash
         received_info_hash = received_handshake[1 + pstrlen_received + 8 : 1 + pstrlen_received + 8 + 20]
+
+        # - Next 20 bytes: peer_id
         peer_peer_id = received_handshake[1 + pstrlen_received + 8 + 20 : HANDSHAKE_LENGTH]
 
+        # Check protocol string matches expected
         if pstr_received != PROTOCOL_STRING:
             print(f"Handshake failed with {peer_addr}: Incorrect protocol string.")
             return None, None, None
 
+        # Check info_hash matches the torrent's info_hash (prevents cross-torrent pollution)
         if received_info_hash != info_hash:
             print(f"Handshake failed with {peer_addr}: Info hash mismatch. Expected {info_hash.hex()}, got {received_info_hash.hex()}")
             return None, None, None
 
+        # If all checks pass, handshake is successful
         print(f"Handshake successful with {peer_addr}. Peer ID: {peer_peer_id.hex()}")
         
         return reader, writer, peer_peer_id
 
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+        # Handle connection errors, timeouts, and OS-level socket errors
         print(f"Failed to connect or handshake with {peer_addr}: {e}")
         if writer: writer.close()
         return None, None, None
     except ValueError as e:
+        # Handle invalid handshake construction (bad info_hash or peer_id)
         print(f"Error creating handshake for {peer_addr}: {e}")
         if writer: writer.close()
         return None, None, None
     except IndexError as e:
+        # Handle unexpected handshake response length/structure
         print(f"Error parsing handshake due to unexpected length or structure from {peer_addr}: {e}. Received data length: {len(received_handshake) if 'received_handshake' in locals() else 'N/A'}")
         if writer: writer.close()
         return None, None, None
     except Exception as e:
+        # Catch-all for any other unexpected errors
         print(f"An unexpected error occurred with {peer_addr}: {e}")
         if writer: writer.close()
         return None, None, None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 async def handle_peer_initial_messages(
@@ -282,6 +378,20 @@ async def handle_peer_initial_messages(
         return None
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def get_next_block_request(peer_state: dict) -> tuple[int, int, int] | None:
     """
     Determines the next block to request from a peer.
@@ -358,6 +468,20 @@ def get_next_block_request(peer_state: dict) -> tuple[int, int, int] | None:
     return None # No suitable block found to request
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def verify_and_save_piece(piece_index: int, piece_data: bytearray):
     """
     Verifies a downloaded piece's hash and saves it to disk.
@@ -429,6 +553,20 @@ async def verify_and_save_piece(piece_index: int, piece_data: bytearray):
         ]
         for key in keys_to_delete:
             del global_torrent_state['outstanding_requests'][key]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 async def peer_download_loop(peer_state: dict):
@@ -568,6 +706,17 @@ async def peer_download_loop(peer_state: dict):
             p for p in global_torrent_state['peers_active'] if p['peer_id'] != peer_state['peer_id']
         ]
         # print(f"Remaining active peers: {len(global_torrent_state['peers_active'])}") # Too chatty
+
+
+
+
+
+
+
+
+
+
+
 
 
 async def main_peer_connection_phase(peers: list, info_hash: bytes, my_peer_id: bytes, torrent_info: dict):
