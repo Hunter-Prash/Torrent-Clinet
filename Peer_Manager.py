@@ -784,6 +784,15 @@ async def peer_download_loop(peer_state: dict):
 
 
 
+
+
+
+
+
+
+
+
+
 async def main_peer_connection_phase(peers: list, info_hash: bytes, my_peer_id: bytes, torrent_info: dict):
     """
     Main function to orchestrate peer connections, handshakes, initial message exchange,
